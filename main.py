@@ -6,6 +6,7 @@ import time
 import warnings
 from random import sample
 
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
@@ -86,6 +87,16 @@ if args.task == 'regression':
     best_mae_error = 1e10
 else:
     best_mae_error = 0.
+
+train_losses = []
+val_losses = []
+epochs = []
+train_targets = []
+train_preds = []
+val_targets = [] 
+val_preds = []
+test_targets = []
+test_preds = []
 
 
 def main():
@@ -172,10 +183,13 @@ def main():
 
     for epoch in range(args.start_epoch, args.epochs):
         # train for one epoch
-        train(train_loader, model, criterion, optimizer, epoch, normalizer)
-
+        train_loss = train(train_loader, model, criterion, optimizer, epoch, normalizer)
+        train_losses.append(train_loss)
+        
         # evaluate on validation set
-        mae_error = validate(val_loader, model, criterion, normalizer)
+        mae_error, val_loss = validate(val_loader, model, criterion, normalizer)
+        val_losses.append(val_loss)
+        epochs.append(epoch)
 
         if mae_error != mae_error:
             print('Exit due to NaN')
@@ -198,6 +212,9 @@ def main():
             'normalizer': normalizer.state_dict(),
             'args': vars(args)
         }, is_best)
+    
+    plot_loss_curves()
+    plot_predictions()
 
     # test best model
     print('---------Evaluate Model on Test Set---------------')
@@ -265,6 +282,11 @@ def train(train_loader, model, criterion, optimizer, epoch, normalizer):
             recalls.update(recall, target.size(0))
             fscores.update(fscore, target.size(0))
             auc_scores.update(auc_score, target.size(0))
+        
+        if args.task == 'regression':
+            pred = normalizer.denorm(output.data.cpu())
+            train_preds.extend(pred.view(-1).tolist())
+            train_targets.extend(target.view(-1).tolist())
 
         # compute gradient and do SGD step
         optimizer.zero_grad()
@@ -300,6 +322,7 @@ def train(train_loader, model, criterion, optimizer, epoch, normalizer):
                     prec=precisions, recall=recalls, f1=fscores,
                     auc=auc_scores)
                 )
+    return losses.avg
 
 
 def validate(val_loader, model, criterion, normalizer, test=False):
@@ -313,12 +336,17 @@ def validate(val_loader, model, criterion, normalizer, test=False):
         recalls = AverageMeter()
         fscores = AverageMeter()
         auc_scores = AverageMeter()
-    if test:
+    
+    global val_targets, val_preds, test_targets, test_preds
+    if not test:
+        val_targets = []
+        val_preds = []
+    else:
         test_targets = []
         test_preds = []
         test_cif_ids = []
 
-    # switch to evaluate mode
+
     model.eval()
 
     end = time.time()
@@ -346,21 +374,23 @@ def validate(val_loader, model, criterion, normalizer, test=False):
             with torch.no_grad():
                 target_var = Variable(target_normed)
 
-        # compute output
+
         output = model(*input_var)
         loss = criterion(output, target_var)
 
-        # measure accuracy and record loss
+
         if args.task == 'regression':
             mae_error = mae(normalizer.denorm(output.data.cpu()), target)
             losses.update(loss.data.cpu().item(), target.size(0))
             mae_errors.update(mae_error, target.size(0))
+            pred = normalizer.denorm(output.data.cpu())
             if test:
-                test_pred = normalizer.denorm(output.data.cpu())
-                test_target = target
-                test_preds += test_pred.view(-1).tolist()
-                test_targets += test_target.view(-1).tolist()
-                test_cif_ids += batch_cif_ids
+                test_preds.extend(pred.view(-1).tolist())
+                test_targets.extend(target.view(-1).tolist())
+                test_cif_ids.extend(batch_cif_ids)
+            else:
+                val_preds.extend(pred.view(-1).tolist())
+                val_targets.extend(target.view(-1).tolist())
         else:
             accuracy, precision, recall, fscore, auc_score = \
                 class_eval(output.data.cpu(), target)
@@ -378,7 +408,6 @@ def validate(val_loader, model, criterion, normalizer, test=False):
                 test_targets += test_target.view(-1).tolist()
                 test_cif_ids += batch_cif_ids
 
-        # measure elapsed time
         batch_time.update(time.time() - end)
         end = time.time()
 
@@ -414,14 +443,68 @@ def validate(val_loader, model, criterion, normalizer, test=False):
     else:
         star_label = '*'
     if args.task == 'regression':
-        print(' {star} MAE {mae_errors.avg:.3f}'.format(star=star_label,
-                                                        mae_errors=mae_errors))
-        return mae_errors.avg
+        return mae_errors.avg, losses.avg
     else:
-        print(' {star} AUC {auc.avg:.3f}'.format(star=star_label,
-                                                 auc=auc_scores))
-        return auc_scores.avg
+        return auc_scores.avg, losses.avg
 
+def plot_loss_curves():
+    plt.figure()
+    plt.plot(epochs, train_losses, 'b-', label='Training loss')
+    plt.plot(epochs, val_losses, 'r-', label='Validation loss')
+    plt.title('Training and validation loss')
+    plt.xlabel('Epochs')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.savefig('loss_curves.png')
+    plt.close()
+
+def save_predictions_to_csv(targets, preds, filename):
+    import csv
+    with open(filename, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(['Actual', 'Predicted'])  
+        for target, pred in zip(targets, preds):
+            writer.writerow([target, pred])
+
+def plot_predictions():
+    plt.figure(figsize=(10, 8))
+    
+    all_targets = train_targets + val_targets
+    all_preds = train_preds + val_preds
+    from sklearn.metrics import r2_score, mean_absolute_error
+    r2 = r2_score(all_targets, all_preds)
+    mae = mean_absolute_error(all_targets, all_preds)
+    
+    save_predictions_to_csv(train_targets, train_preds, 'train_predictions.csv')
+    save_predictions_to_csv(val_targets, val_preds, 'val_predictions.csv')
+    
+    min_val = min(min(all_targets), min(all_preds))
+    max_val = max(max(all_targets), max(all_preds))
+    margin = (max_val - min_val) * 0.1
+    lims = [min_val - margin, max_val + margin]
+    
+    plt.scatter(train_targets, train_preds, alpha=0.5, c='blue', label='Train')
+    plt.scatter(val_targets, val_preds, alpha=0.5, c='green', label='Validation')
+    if test_targets:
+        plt.scatter(test_targets, test_preds, alpha=0.5, c='red', label='Test')
+        save_predictions_to_csv(test_targets, test_preds, 'test_predictions.csv')
+    
+    plt.plot(lims, lims, 'k--', alpha=0.75, zorder=0)
+    
+    plt.xlabel('actual')
+    plt.ylabel('Predicted')
+    plt.xlim(lims)
+    plt.ylim(lims)
+    
+    plt.text(0.05, 0.95, f'R² = {r2:.3f}\nMAE = {mae:.3f} eV',
+             transform=plt.gca().transAxes, ha='left', va='top',
+             bbox=dict(facecolor='white', alpha=0.8))
+    
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig('absorption_energy_predictions.png', dpi=300)
+    plt.close()
 
 class Normalizer(object):
     """Normalize a Tensor and restore it later. """
